@@ -190,6 +190,47 @@ you can do:
 scd https://github.com/Applied-Intuition-Open-Source/stol/pull/1
 ```
 
+## tui
+
+`stol tui` is an interactive terminal UI for browsing and managing all your
+worktrees. It lists every project and worktree under `$STOL_ROOT` with branch
+names, dirty-file counts, and how recently each worktree was used.
+
+```sh
+stol tui          # or use the `stui` shell function to cd on selection
+```
+
+Because a TUI process cannot change your shell's directory, `stol tui` prints
+the selected path on exit and nothing if you quit. Use the wrapper function
+from `stol-tui.bash` to cd there directly:
+
+```sh
+# add to your shell config (bash and zsh both work):
+source ~/.local/share/stol/stol-tui.bash
+stui              # browse and cd into a worktree
+```
+
+Keys:
+
+| Key   | Action                                                    |
+| ----- | --------------------------------------------------------- |
+| `↑/↓` | move selection (also `j`/`k`, PgUp/PgDn, Home/End)        |
+| `↵`   | exit and print the selected path (cd with `stui`)         |
+| `s`   | open `$SHELL` in the selected worktree                    |
+| `n`   | create a new worktree in the selected project             |
+| `e`   | check out an existing branch in a new worktree            |
+| `d`   | delete the selected worktree (uses `stol rm`, runs hooks) |
+| `y`   | sync the selected project (`stol sync`)                   |
+| `/`   | filter entries by name, branch, or project                |
+| `t`   | toggle sorting by name / modification time                |
+| space | collapse or expand the selected project                   |
+| `r`   | refresh (re-scan worktrees and git state)                 |
+| `?`   | help                                                      |
+| `q`   | quit without changing directory                           |
+
+`stol tui` has no dependencies beyond python3 (it uses the standard curses
+module).
+
 ## Hooks
 
 You can add hooks to customize stol commands by placing executables in

@@ -31,7 +31,7 @@ install: $(RELOCATE_INDEX)
 	install -m 755 src/stol src/stol-* $(BINDIR)
 	install -m 755 $(RELOCATE_INDEX) $(BINDIR)
 	mkdir -p $(DATADIR)
-	install -m 644 src/stol.bash src/stol.zsh src/stol.fish $(DATADIR)
+	install -m 644 src/stol.bash src/stol.zsh src/stol.fish src/stol-tui.bash $(DATADIR)
 	@echo
 	@echo "Installed stol to $(BINDIR)"
 	@printf '\033[1mTo complete installation, add the following to your shell config:\033[0m\n'

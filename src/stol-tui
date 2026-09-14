@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+# Copyright (C) 2026 Applied Intuition
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""stol tui - interactive browser for stol worktrees.
+
+Prints the selected directory on stdout (nothing on quit), so the intended
+usage is from a shell function:
+
+    cd "$(stol tui)"
+
+Keys:
+    up/down     move selection
+    enter       cd to selected worktree (or project directory)
+    s           open $SHELL in the selected worktree
+    n           create a new worktree in the selected project
+    e           check out an existing branch in a new worktree
+    d           delete the selected worktree (uses `stol rm`, runs hooks)
+    y           sync the selected project (`stol sync`)
+    t           toggle sort by name / modification time
+    /           filter entries
+    space       collapse/expand a project
+    r           refresh
+    ?           help
+    q / esc     quit
+"""
+
+import curses
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+STOL_ROOT = os.environ.get("STOL_ROOT", "/mnt/work")
+PROJECTS_DIR = os.path.join(STOL_ROOT, "projects")
+
+
+class Entry:
+    """A row in the list: either a project or a worktree directory."""
+
+    def __init__(self, kind, project, path, name, mtime):
+        self.kind = kind          # "project" | "worktree" | "template"
+        self.project = project    # project name (worktree/template only)
+        self.path = path
+        self.name = name
+        self.mtime = mtime
+        self.branch = ""
+        self.dirty = 0
+        self.ahead = 0            # commits ahead of upstream
+
+    @property
+    def selectable(self):
+        return True
+
+    def display(self):
+        return self.name
+
+
+def run_git(path, args):
+    """Run git in path, returning stripped stdout or ""."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", path, *args],
+            capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def inspect_worktree(path, name, project):
+    """Populate git info for a single worktree directory."""
+    e = Entry("template" if name.startswith("00-") else "worktree",
+              project, path, name, dir_mtime(path))
+    e.branch = run_git(path, ["branch", "--show-current"])
+    out = run_git(path, ["status", "--porcelain"])
+    if out:
+        e.dirty = len(out.splitlines())
+    # ahead of upstream, if it has one
+    out = run_git(path, ["rev-list", "--count", "@{upstream}..HEAD"])
+    if out.isdigit():
+        e.ahead = int(out)
+    return e
+
+
+def dir_mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def load_entries(sort_time=False):
+    """Scan STOL_ROOT/projects and collect project + worktree entries."""
+    entries = []
+    if not os.path.isdir(PROJECTS_DIR):
+        return entries
+    projects = sorted(d for d in os.listdir(PROJECTS_DIR)
+                      if os.path.isdir(os.path.join(PROJECTS_DIR, d)))
+
+    def worktree_dirs(project):
+        pdir = os.path.join(PROJECTS_DIR, project)
+        wts = []
+        for name in sorted(os.listdir(pdir)):
+            path = os.path.join(pdir, name)
+            if not os.path.isdir(path) or name in (".repo", ".stol"):
+                continue
+            wts.append((path, name))
+        return wts
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            project: [pool.submit(inspect_worktree, p, n, project) for p, n in worktree_dirs(project)]
+            for project in projects
+        }
+        for project in projects:
+            pdir = os.path.join(PROJECTS_DIR, project)
+            entries.append(Entry("project", project, pdir, project, dir_mtime(pdir)))
+            wts = [f.result() for f in futures[project]]
+            if sort_time:
+                wts.sort(key=lambda e: e.mtime, reverse=True)
+            entries.extend(wts)
+    if sort_time:
+        entries.sort(key=lambda e: (e.kind != "project", -e.mtime, e.project))
+    return entries
+
+
+def fmt_ago(ts):
+    s = int(time.time() - ts)
+    if s < 0:
+        return "now"
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= div:
+            return f"{s // div}{unit}"
+    return f"{s}s"
+
+
+class Tui:
+    def __init__(self, screen):
+        self.screen = screen
+        self.result = None       # path to print on successful exit
+        self.entries = []
+        self.collapsed = set()
+        self.cur = 0
+        self.top = 0
+        self.sort_time = False
+        self.filter = ""
+        self.message = ""
+        self.rows = []  # list of (entry) rendered on screen, in order
+
+        curses.start_color()
+        curses.use_default_colors()
+        for i, (fg, bg) in enumerate([
+            (-1, -1),                    # 0 normal
+            (curses.COLOR_CYAN, -1),     # 1 project header
+            (curses.COLOR_GREEN, -1),    # 2 selected
+            (curses.COLOR_YELLOW, -1),   # 3 template
+            (curses.COLOR_RED, -1),      # 4 dirty
+            (curses.COLOR_MAGENTA, -1),  # 5 branch
+            (curses.COLOR_BLACK, -1),    # 6 dim
+        ]):
+            curses.init_pair(i + 1, fg, bg)
+        self.refresh_data()
+
+    # ----- data -----
+
+    def refresh_data(self):
+        self.entries = load_entries(self.sort_time)
+        self.rebuild_rows()
+
+    def rebuild_rows(self):
+        """Flatten entries honoring collapsed projects and the filter."""
+        f = self.filter.lower()
+        rows = []
+        for e in self.entries:
+            if e.kind == "project":
+                rows.append(e)
+            else:
+                # an active filter overrides collapsed projects so matches stay visible
+                if not f and e.project in self.collapsed:
+                    continue
+                if f and f not in e.name.lower() and f not in e.branch.lower() \
+                        and f not in e.project.lower():
+                    continue
+                rows.append(e)
+        self.rows = rows
+        if self.cur >= len(self.rows):
+            self.cur = max(0, len(self.rows) - 1)
+
+    def current(self):
+        if 0 <= self.cur < len(self.rows):
+            return self.rows[self.cur]
+        return None
+
+    # ----- actions -----
+
+    def suspend(self):
+        """Leave curses mode temporarily to interact with the terminal directly."""
+        curses.def_prog_mode()
+        curses.endwin()
+
+    def resume(self):
+        curses.reset_prog_mode()
+        self.screen.refresh()
+        self.draw()
+
+    def spawn_shell(self, path):
+        shell = os.environ.get("SHELL", "/bin/bash")
+        self.suspend()
+        print(f"# subshell in {path} (exit to return to stol tui)")
+        rc = subprocess.call([shell, "-i"], cwd=path)
+        self.message = f"subshell exited with {rc}"
+        self.resume()
+
+    def run_stol(self, args, cwd=None):
+        """Run a stol command, showing output after it finishes."""
+        self.suspend()
+        cmd = ["stol", *args]
+        print(f"$ {' '.join(cmd)}")
+        try:
+            rc = subprocess.call(cmd, cwd=cwd)
+        except FileNotFoundError:
+            rc = 1
+            print("stol not found on PATH")
+        print("-- press enter to continue --")
+        input()
+        self.message = f"{cmd[1]} {'ok' if rc == 0 else f'failed ({rc})'}"
+        self.resume()
+        self.refresh_data()
+
+    def confirm(self, question):
+        return self.prompt(f"{question} (y/N) ", allow_empty=True).strip().lower() == "y"
+
+    def prompt(self, label, allow_empty=False):
+        """Read a line of input at the bottom of the screen."""
+        height, width = self.screen.getmaxyx()
+        self.screen.move(height - 1, 0)
+        self.screen.clrtoeol()
+        self.screen.addstr(height - 1, 0, label, curses.color_pair(6) | curses.A_BOLD)
+        self.screen.refresh()
+        curses.echo()
+        try:
+            text = self.screen.getstr(height - 1, len(label)).decode("utf-8", "replace")
+        except Exception:
+            text = ""
+        curses.noecho()
+        self.screen.move(height - 1, 0)
+        self.screen.clrtoeol()
+        if not text and not allow_empty:
+            return None
+        return text
+
+    # ----- drawing -----
+
+    def line_attrs(self, e, selected):
+        if selected:
+            return curses.color_pair(2) | curses.A_BOLD
+        if e.kind == "project":
+            return curses.color_pair(1) | curses.A_BOLD
+        if e.kind == "template":
+            return curses.color_pair(3)
+        return curses.color_pair(0)
+
+    def draw(self):
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+
+        # header
+        header = f" stol tui  {STOL_ROOT}"
+        if self.filter:
+            header += f"   [filter: /{self.filter}]"
+        header += f"   [sort: {'time' if self.sort_time else 'name'}]"
+        self.screen.addstr(0, 0, header[:width - 1], curses.color_pair(6))
+
+        # entries
+        avail = max(1, height - 4)
+        if self.cur < self.top:
+            self.top = self.cur
+        if self.cur >= self.top + avail:
+            self.top = self.cur - avail + 1
+        view = self.rows[self.top:self.top + avail]
+
+        for i, e in enumerate(view):
+            row = self.top + i
+            selected = row == self.cur
+            indent = "" if e.kind == "project" else "  "
+            if e.kind == "project":
+                arrow = "+" if e.name in self.collapsed else "-"
+                left = f"{indent}{arrow} {e.name}/"
+            else:
+                marker = ""
+                if e.dirty:
+                    marker = f" [~{e.dirty}]"
+                if e.ahead:
+                    marker += f" [+{e.ahead}]"
+                left = f"{indent}{e.name}{marker}"
+
+            right = ""
+            if e.kind == "project":
+                right = fmt_ago(e.mtime)
+            elif e.branch:
+                right = f"{e.branch}" + (f" · {fmt_ago(e.mtime)}" if not selected else "")
+            if right:
+                pad = max(1, width - 1 - len(left) - len(right) - 1)
+                left = left + " " * pad + right
+
+            try:
+                self.screen.addstr(row + 1, 0, left[:width - 1], self.line_attrs(e, selected))
+            except curses.error:
+                pass
+
+        # footer
+        footer = (" ↑↓ move  enter cd  s shell  n new  e existing  d del  y sync"
+                  "  / filter  t sort  space fold  r refresh  q quit")
+        self.screen.addstr(height - 2, 0, footer[:width - 1], curses.color_pair(6))
+        if self.message:
+            self.screen.addstr(height - 1, 0, self.message[:width - 1],
+                               curses.color_pair(4))
+        self.screen.refresh()
+
+    def loop(self):
+        self.draw()
+        while True:
+            key = self.screen.getch()
+            h, w = self.screen.getmaxyx()
+            if key == curses.KEY_RESIZE:
+                curses.resizeterm(h, w)
+                self.draw()
+                continue
+
+            if key == curses.KEY_UP or key == ord("k"):
+                self.cur = max(0, self.cur - 1)
+            elif key == curses.KEY_DOWN or key == ord("j"):
+                self.cur = min(len(self.rows) - 1, self.cur + 1)
+            elif key == curses.KEY_PPAGE:
+                self.cur = max(0, self.cur - (h - 5))
+            elif key == curses.KEY_NPAGE:
+                self.cur = min(len(self.rows) - 1, self.cur + (h - 5))
+            elif key == curses.KEY_HOME or key == ord("g"):
+                self.cur = 0
+            elif key == curses.KEY_END or key == ord("G"):
+                self.cur = len(self.rows) - 1
+            elif key in (10, 13, curses.KEY_ENTER):  # enter
+                e = self.current()
+                if e:
+                    self.result = e.path
+                    return self.result
+                continue
+            elif key == ord("s"):
+                e = self.current()
+                if e and e.kind != "project":
+                    self.spawn_shell(e.path)
+            elif key == ord("n"):
+                e = self.current()
+                if not e:
+                    continue
+                name = self.prompt(f"new worktree in {e.project}: ")
+                if name:
+                    self.run_stol(["new", name], cwd=os.path.join(PROJECTS_DIR, e.project))
+            elif key == ord("e"):
+                e = self.current()
+                if not e:
+                    continue
+                branch = self.prompt(f"existing branch in {e.project}: ")
+                if branch:
+                    self.run_stol(["new", "--existing", branch],
+                                  cwd=os.path.join(PROJECTS_DIR, e.project))
+            elif key == ord("d"):
+                e = self.current()
+                if e and e.kind != "project":
+                    if self.confirm(f"delete worktree {e.project}/{e.name}?"):
+                        self.run_stol(["rm", f"{e.project}/{e.name}"])
+            elif key == ord("y"):
+                e = self.current()
+                if e:
+                    self.run_stol(["sync", e.project])
+            elif key == ord("t"):
+                self.sort_time = not self.sort_time
+                self.refresh_data()
+                self.message = f"sorted by {'time' if self.sort_time else 'name'}"
+            elif key == ord("/"):
+                text = self.prompt("filter: ", allow_empty=True)
+                self.filter = text or ""
+                self.rebuild_rows()
+                self.top = 0
+            elif key == ord("r"):
+                self.refresh_data()
+                self.message = "refreshed"
+            elif key == ord(" ") and self.current() and self.current().kind == "project":
+                name = self.current().name
+                if name in self.collapsed:
+                    self.collapsed.discard(name)
+                else:
+                    self.collapsed.add(name)
+                self.rebuild_rows()
+            elif key == ord("?"):
+                self.show_help()
+                self.draw()
+            elif key in (ord("q"), 27):  # q or escape
+                return None
+            self.draw()
+
+    def show_help(self):
+        self.screen.erase()
+        h, w = self.screen.getmaxyx()
+        lines = __doc__.splitlines()
+        self.screen.addstr(0, 0, " stol tui help", curses.color_pair(1) | curses.A_BOLD)
+        for i, line in enumerate(lines[9:], start=1):  # skip module docstring preamble
+            if i + 1 >= h:
+                break
+            try:
+                self.screen.addstr(i + 1, 0, ("  " + line.strip())[:w - 1])
+            except curses.error:
+                pass
+        self.screen.addstr(h - 2, 0, "press any key to return", curses.color_pair(6))
+        self.screen.refresh()
+        self.screen.getch()
+
+
+def main():
+    if not os.path.isdir(PROJECTS_DIR):
+        print(f"stol tui: no such directory: {PROJECTS_DIR}", file=sys.stderr)
+        print("set STOL_ROOT to your stol filesystem root", file=sys.stderr)
+        return 1
+
+    # When stdout is not a terminal (e.g. invoked as `cd "$(stol tui)"`), the
+    # TUI must render on /dev/tty instead. Point fd 1 at the tty and remember
+    # the original pipe so only the final path is written to stdout; without
+    # this, curses output would be swallowed by the pipe and the screen would
+    # appear frozen, and command output would pollute the captured result.
+    result_fd = None
+    if not sys.stdout.isatty():
+        try:
+            tty_fd = os.open("/dev/tty", os.O_RDWR)
+        except OSError as e:
+            print(f"stol tui: no controlling terminal: {e}", file=sys.stderr)
+            return 1
+        result_fd = os.dup(1)
+        os.dup2(tty_fd, 1)
+        os.close(tty_fd)
+        sys.stdout.reconfigure(line_buffering=True)
+
+    try:
+        result = curses.wrapper(lambda scr: Tui(scr).loop())
+    except curses.error as e:
+        print(f"stol tui: terminal error: {e}", file=sys.stderr)
+        result = None
+
+    if result_fd is not None:
+        if result:
+            os.write(result_fd, (result + "\n").encode())
+        os.close(result_fd)
+    elif result:
+        print(result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
