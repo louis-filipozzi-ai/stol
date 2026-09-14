@@ -31,6 +31,7 @@ Keys:
     t           toggle sort by name / modification time
     /           filter entries
     space       collapse/expand a project
+    tab         toggle the detail pane
     r           refresh
     ?           help
     q / esc     quit
@@ -40,11 +41,34 @@ import curses
 import os
 import subprocess
 import sys
+import textwrap
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 STOL_ROOT = os.environ.get("STOL_ROOT", "/mnt/work")
 PROJECTS_DIR = os.path.join(STOL_ROOT, "projects")
+
+GIT_TIMEOUT = 15
+
+
+def fuzzy_score(query, s):
+    """fzf-lite subsequence match. Returns a score (higher is better) or None."""
+    q, t = query.lower(), s.lower()
+    pos, score, last, first = 0, 0, -2, None
+    for ch in q:
+        idx = t.find(ch, pos)
+        if idx < 0:
+            return None
+        if first is None:
+            first = idx
+        if idx == last + 1:
+            score += 2          # consecutive run bonus
+        if idx == 0 or t[idx - 1] in "/-_ .":
+            score += 2          # word boundary bonus
+        score += 1
+        last, pos = idx, idx + 1
+    return score * 2 - (last - first + 1)   # prefer compact spans
 
 
 class Entry:
@@ -60,39 +84,20 @@ class Entry:
         self.dirty = 0
         self.ahead = 0            # commits ahead of upstream
 
-    @property
-    def selectable(self):
-        return True
-
     def display(self):
         return self.name
 
 
-def run_git(path, args):
+def run_git(path, args, timeout=GIT_TIMEOUT):
     """Run git in path, returning stripped stdout or ""."""
     try:
         out = subprocess.run(
             ["git", "-C", path, *args],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=timeout,
         )
         return out.stdout.strip() if out.returncode == 0 else ""
     except Exception:
         return ""
-
-
-def inspect_worktree(path, name, project):
-    """Populate git info for a single worktree directory."""
-    e = Entry("template" if name.startswith("00-") else "worktree",
-              project, path, name, dir_mtime(path))
-    e.branch = run_git(path, ["branch", "--show-current"])
-    out = run_git(path, ["status", "--porcelain"])
-    if out:
-        e.dirty = len(out.splitlines())
-    # ahead of upstream, if it has one
-    out = run_git(path, ["rev-list", "--count", "@{upstream}..HEAD"])
-    if out.isdigit():
-        e.ahead = int(out)
-    return e
 
 
 def dir_mtime(path):
@@ -100,6 +105,30 @@ def dir_mtime(path):
         return os.stat(path).st_mtime
     except OSError:
         return 0.0
+
+
+def fmt_ago(ts):
+    s = int(time.time() - ts)
+    if s < 0:
+        return "now"
+    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= div:
+            return f"{s // div}{unit}"
+    return f"{s}s"
+
+
+def inspect_worktree(path, name, project):
+    """Populate git info for a single worktree directory."""
+    e = Entry("template" if name.startswith("00-") else "worktree",
+              project, path, name, dir_mtime(path))
+    e.branch = run_git(path, ["branch", "--show-current"], timeout=10)
+    out = run_git(path, ["status", "--porcelain"], timeout=60)
+    if out:
+        e.dirty = len(out.splitlines())
+    out = run_git(path, ["rev-list", "--count", "@{upstream}..HEAD"], timeout=10)
+    if out.isdigit():
+        e.ahead = int(out)
+    return e
 
 
 def load_entries(sort_time=False):
@@ -122,7 +151,8 @@ def load_entries(sort_time=False):
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {
-            project: [pool.submit(inspect_worktree, p, n, project) for p, n in worktree_dirs(project)]
+            project: [pool.submit(inspect_worktree, p, n, project)
+                      for p, n in worktree_dirs(project)]
             for project in projects
         }
         for project in projects:
@@ -137,20 +167,100 @@ def load_entries(sort_time=False):
     return entries
 
 
-def fmt_ago(ts):
-    s = int(time.time() - ts)
-    if s < 0:
-        return "now"
-    for unit, div in (("d", 86400), ("h", 3600), ("m", 60)):
-        if s >= div:
-            return f"{s // div}{unit}"
-    return f"{s}s"
+# ---------------------------------------------------------------------------
+# Detail pane: computed in the background for the selected entry.
+# Each line is a (style, text) tuple where style is one of:
+#   head  - section header (bold cyan)
+#   val   - emphasized value (green)
+#   warn  - problem indicator (red)
+#   dim   - subdued metadata
+#   norm  - plain text
+# ---------------------------------------------------------------------------
+
+def compute_detail(path, entry):
+    """Gather git details for one worktree. Returns a list of (style, text)."""
+    if entry.kind == "project":
+        return compute_project_detail(path, entry)
+
+    lines = []
+    branch = entry.branch or "(detached)"
+
+    # upstream tracking state
+    upstream = run_git(path, ["rev-parse", "--abbrev-ref", "@{upstream}"], timeout=10)
+    track = ""
+    if upstream:
+        counts = run_git(path, ["rev-list", "--left-right", "--count",
+                                f"{upstream}...HEAD"], timeout=10)
+        if "\t" in counts:
+            behind, ahead = counts.split("\t")
+            track = f" · {upstream}"
+            if ahead != "0" or behind != "0":
+                track += f" (↑{ahead} ↓{behind})"
+    lines.append(("head", "Branch"))
+    lines.append(("val", f"  {branch}{track}"))
+
+    # last commit
+    out = run_git(path, ["log", "-1", "--format=%h%n%an%n%ar%n%s"], timeout=10)
+    if out:
+        sha, author, when, subject = (out.splitlines() + [""] * 4)[:4]
+        lines.append(("head", "Last commit"))
+        lines.append(("val", f"  {sha}"))
+        lines.append(("norm", f"  {subject}"))
+        lines.append(("dim", f"  {author} · {when}"))
+
+    # dirty files (porcelain status, truncated)
+    out = run_git(path, ["status", "--porcelain"], timeout=60)
+    if out:
+        entries_ = out.splitlines()
+        lines.append(("head", f"Status ({len(entries_)} dirty)"))
+        for line in entries_[:20]:
+            style = "warn" if line[:2].strip() in ("M", "D") else "norm"
+            lines.append((style, "  " + line))
+        if len(entries_) > 20:
+            lines.append(("dim", f"  … and {len(entries_) - 20} more"))
+    else:
+        lines.append(("head", "Status"))
+        lines.append(("val", "  clean"))
+
+    # diffstat vs upstream
+    if upstream:
+        out = run_git(path, ["diff", "--stat", f"{upstream}...HEAD"], timeout=GIT_TIMEOUT)
+        if out:
+            summary = out.splitlines()[-1]
+            lines.append(("head", f"Diff vs {upstream}"))
+            lines.append(("norm", f"  {summary}"))
+
+    # reflog for this worktree's HEAD
+    out = run_git(path, ["reflog", "--date=relative", "-n", "12"], timeout=10)
+    if out:
+        lines.append(("head", "Reflog"))
+        for line in out.splitlines()[:12]:
+            lines.append(("norm", "  " + line))
+    return lines
+
+
+def compute_project_detail(path, entry):
+    lines = [("head", "Project"), ("val", f"  {entry.name}")]
+    lines.append(("dim", f"  {path}"))
+    lines.append(("dim", f"  last used {fmt_ago(entry.mtime)} ago"))
+    out = run_git(path, ["worktree", "list", "--porcelain"], timeout=10)
+    if out:
+        blocks = out.split("\n\n")
+        n = sum(1 for b in blocks if b.strip() and "detached" not in b or b.strip())
+        lines.append(("head", f"Worktrees ({max(0, len(blocks))})"))
+        for b in blocks[:15]:
+            first = b.splitlines()[0] if b.strip() else ""
+            name = os.path.basename(first.replace("worktree ", "")) if first else ""
+            br = next((l.replace("branch ", "") for l in b.splitlines()
+                       if l.startswith("branch")), "detached")
+            if name:
+                lines.append(("norm", f"  {name}  [{br.replace('refs/heads/', '')}]"))
+    return lines
 
 
 class Tui:
     def __init__(self, screen):
         self.screen = screen
-        self.result = None       # path to print on successful exit
         self.entries = []
         self.collapsed = set()
         self.cur = 0
@@ -158,43 +268,81 @@ class Tui:
         self.sort_time = False
         self.filter = ""
         self.message = ""
-        self.rows = []  # list of (entry) rendered on screen, in order
+        self.rows = []          # rows currently visible, in order
+        self.show_pane = True
+
+        # detail pane state
+        self.detail_cache = {}  # path -> list of (style, text)
+        self.detail_jobs = []   # (path, Thread) in flight
 
         curses.start_color()
         curses.use_default_colors()
         for i, (fg, bg) in enumerate([
-            (-1, -1),                    # 0 normal
-            (curses.COLOR_CYAN, -1),     # 1 project header
-            (curses.COLOR_GREEN, -1),    # 2 selected
-            (curses.COLOR_YELLOW, -1),   # 3 template
-            (curses.COLOR_RED, -1),      # 4 dirty
-            (curses.COLOR_MAGENTA, -1),  # 5 branch
-            (curses.COLOR_BLACK, -1),    # 6 dim
+            (-1, -1),                    # 1 normal
+            (curses.COLOR_CYAN, -1),     # 2 project header
+            (curses.COLOR_GREEN, -1),    # 3 selected
+            (curses.COLOR_YELLOW, -1),   # 4 template
+            (curses.COLOR_RED, -1),      # 5 dirty/warn
+            (curses.COLOR_MAGENTA, -1),  # 6 branch
+            (curses.COLOR_BLACK, -1),    # 7 dim
+            (curses.COLOR_CYAN, -1),     # 8 pane header
         ]):
             curses.init_pair(i + 1, fg, bg)
+        self.ATTR = {
+            "norm": curses.color_pair(1),
+            "head": curses.color_pair(8) | curses.A_BOLD,
+            "val": curses.color_pair(3),
+            "warn": curses.color_pair(5),
+            # A_DIM is an intensity attribute, not a color, so subdued text
+            # stays visible under any color scheme
+            "dim": curses.color_pair(1) | curses.A_DIM,
+        }
         self.refresh_data()
 
     # ----- data -----
 
     def refresh_data(self):
         self.entries = load_entries(self.sort_time)
+        self.detail_cache = {}
+        self.detail_jobs = []
         self.rebuild_rows()
 
     def rebuild_rows(self):
-        """Flatten entries honoring collapsed projects and the filter."""
-        f = self.filter.lower()
+        """Flatten entries honoring collapsed projects and the filter.
+
+        With an active filter, matching is fuzzy (subsequence) and rows are
+        ranked best-match first while keeping project grouping."""
+        f = self.filter.strip()
         rows = []
-        for e in self.entries:
-            if e.kind == "project":
-                rows.append(e)
-            else:
-                # an active filter overrides collapsed projects so matches stay visible
-                if not f and e.project in self.collapsed:
+        if f:
+            # score every worktree against name/branch/project
+            children = {}       # project -> [(score, entry)]
+            proj_best = {}      # project -> best child score
+            for e in self.entries:
+                if e.kind == "project":
                     continue
-                if f and f not in e.name.lower() and f not in e.branch.lower() \
-                        and f not in e.project.lower():
+                best = max(
+                    (s for s in (fuzzy_score(f, e.name), fuzzy_score(f, e.branch),
+                                 fuzzy_score(f, e.project)) if s is not None),
+                    default=None)
+                if best is None:
                     continue
-                rows.append(e)
+                children.setdefault(e.project, []).append((best, e))
+                proj_best[e.project] = max(proj_best.get(e.project, -(1 << 30)), best)
+            pentries = {e.name: e for e in self.entries if e.kind == "project"}
+            for proj in sorted(children, key=lambda p: -proj_best[p]):
+                if proj in pentries:
+                    rows.append(pentries[proj])
+                for _, e in sorted(children[proj], key=lambda t: -t[0]):
+                    rows.append(e)
+        else:
+            for e in self.entries:
+                if e.kind == "project":
+                    rows.append(e)
+                else:
+                    if e.project in self.collapsed:
+                        continue
+                    rows.append(e)
         self.rows = rows
         if self.cur >= len(self.rows):
             self.cur = max(0, len(self.rows) - 1)
@@ -204,17 +352,30 @@ class Tui:
             return self.rows[self.cur]
         return None
 
+    # ----- detail pane -----
+
+    def ensure_detail(self, entry):
+        """Kick off background computation of the detail pane, if needed."""
+        if entry.path in self.detail_cache:
+            return
+        if any(p == entry.path for p, _ in self.detail_jobs):
+            return
+        t = threading.Thread(target=self._detail_worker,
+                             args=(entry.path, entry), daemon=True)
+        self.detail_jobs.append((entry.path, t))
+        t.start()
+
+    def _detail_worker(self, path, entry):
+        self.detail_cache[path] = compute_detail(path, entry)
+
+    def reap_detail_jobs(self):
+        """Drop finished jobs; True if anything completed since last call."""
+        alive = [(p, t) for p, t in self.detail_jobs if t.is_alive()]
+        done = len(alive) < len(self.detail_jobs)
+        self.detail_jobs = alive
+        return done
+
     # ----- actions -----
-
-    def suspend(self):
-        """Leave curses mode temporarily to interact with the terminal directly."""
-        curses.def_prog_mode()
-        curses.endwin()
-
-    def resume(self):
-        curses.reset_prog_mode()
-        self.screen.refresh()
-        self.draw()
 
     def spawn_shell(self, path):
         shell = os.environ.get("SHELL", "/bin/bash")
@@ -222,6 +383,7 @@ class Tui:
         print(f"# subshell in {path} (exit to return to stol tui)")
         rc = subprocess.call([shell, "-i"], cwd=path)
         self.message = f"subshell exited with {rc}"
+        self.detail_cache.pop(path, None)
         self.resume()
 
     def run_stol(self, args, cwd=None):
@@ -240,6 +402,16 @@ class Tui:
         self.resume()
         self.refresh_data()
 
+    def suspend(self):
+        """Leave curses mode temporarily to interact with the terminal directly."""
+        curses.def_prog_mode()
+        curses.endwin()
+
+    def resume(self):
+        curses.reset_prog_mode()
+        self.screen.refresh()
+        self.draw()
+
     def confirm(self, question):
         return self.prompt(f"{question} (y/N) ", allow_empty=True).strip().lower() == "y"
 
@@ -248,7 +420,7 @@ class Tui:
         height, width = self.screen.getmaxyx()
         self.screen.move(height - 1, 0)
         self.screen.clrtoeol()
-        self.screen.addstr(height - 1, 0, label, curses.color_pair(6) | curses.A_BOLD)
+        self.screen.addstr(height - 1, 0, label, curses.color_pair(1) | curses.A_BOLD)
         self.screen.refresh()
         curses.echo()
         try:
@@ -262,29 +434,73 @@ class Tui:
             return None
         return text
 
+    def filter_prompt(self):
+        """Live fuzzy filter: the list updates as you type, fzf-style.
+
+        Enter accepts the query, Esc clears it, Ctrl-U clears the line.
+        The shortcut footer stays visible on the line above."""
+        height, width = self.screen.getmaxyx()
+        q = self.filter
+        self.message = ""
+        while True:
+            self.filter = q
+            self.rebuild_rows()
+            self.cur = 0
+            self.top = 0
+            self.draw()
+            prompt = f" / {q}█" if q else " / (fuzzy filter) █"
+            try:
+                self.screen.addstr(height - 1, 0, prompt[:width - 1],
+                                   curses.color_pair(1) | curses.A_BOLD)
+                self.screen.clrtoeol()
+            except curses.error:
+                pass
+            self.screen.refresh()
+
+            key = self.screen.getch()
+            if key in (10, 13, curses.KEY_ENTER):
+                self.filter = q
+                break
+            elif key == 27:  # esc clears the filter
+                q = ""
+                self.filter = ""
+                self.rebuild_rows()
+                self.cur = 0
+                self.top = 0
+                break
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                q = q[:-1]
+            elif key == 21:  # ctrl-u
+                q = ""
+            elif 32 <= key <= 126:
+                q += chr(key)
+
     # ----- drawing -----
 
     def line_attrs(self, e, selected):
         if selected:
-            return curses.color_pair(2) | curses.A_BOLD
+            return curses.color_pair(3) | curses.A_BOLD
         if e.kind == "project":
-            return curses.color_pair(1) | curses.A_BOLD
+            return curses.color_pair(2) | curses.A_BOLD
         if e.kind == "template":
-            return curses.color_pair(3)
-        return curses.color_pair(0)
+            return curses.color_pair(4)
+        return curses.color_pair(1)
 
     def draw(self):
         self.screen.erase()
         height, width = self.screen.getmaxyx()
+
+        pane = self.show_pane and width >= 100
+        list_w = min(46, max(30, width // 3)) if pane else width
 
         # header
         header = f" stol tui  {STOL_ROOT}"
         if self.filter:
             header += f"   [filter: /{self.filter}]"
         header += f"   [sort: {'time' if self.sort_time else 'name'}]"
-        self.screen.addstr(0, 0, header[:width - 1], curses.color_pair(6))
+        self.screen.addstr(0, 0, header[:width - 1], curses.color_pair(1) | curses.A_DIM)
 
-        # entries
+        # list pane
         avail = max(1, height - 4)
         if self.cur < self.top:
             self.top = self.cur
@@ -292,52 +508,108 @@ class Tui:
             self.top = self.cur - avail + 1
         view = self.rows[self.top:self.top + avail]
 
+        lw = list_w - 1  # leave the separator column
         for i, e in enumerate(view):
             row = self.top + i
             selected = row == self.cur
-            indent = "" if e.kind == "project" else "  "
             if e.kind == "project":
                 arrow = "+" if e.name in self.collapsed else "-"
-                left = f"{indent}{arrow} {e.name}/"
+                left = f"{arrow} {e.name}/"
             else:
                 marker = ""
                 if e.dirty:
                     marker = f" [~{e.dirty}]"
                 if e.ahead:
                     marker += f" [+{e.ahead}]"
-                left = f"{indent}{e.name}{marker}"
-
-            right = ""
-            if e.kind == "project":
-                right = fmt_ago(e.mtime)
-            elif e.branch:
-                right = f"{e.branch}" + (f" · {fmt_ago(e.mtime)}" if not selected else "")
-            if right:
-                pad = max(1, width - 1 - len(left) - len(right) - 1)
-                left = left + " " * pad + right
-
+                left = f"  {e.name}{marker}"
+            right = e.branch if (e.kind != "project" and e.branch) else fmt_ago(e.mtime)
+            pad = max(1, lw - len(left) - len(right))
+            line = (left + " " * pad + right)[:lw]
             try:
-                self.screen.addstr(row + 1, 0, left[:width - 1], self.line_attrs(e, selected))
+                self.screen.addstr(row + 1, 0, line, self.line_attrs(e, selected))
             except curses.error:
                 pass
 
+        # detail pane, boxed with rounded corners like an fzf preview window
+        if pane:
+            cur = self.current()
+            bx, bw = list_w, width - list_w      # box columns
+            top, bot = 1, height - 3             # box rows
+            # default foreground, normal intensity: visible under any scheme
+            edge = curses.color_pair(1)
+            try:
+                title = f"─ {cur.name} " if cur else "─"
+                fill = "─" * max(0, bw - len(title) - 2)
+                self.screen.addstr(top, bx, f"╭{title}{fill}╮"[:bw], edge)
+                for row in range(top + 1, bot):
+                    self.screen.addstr(row, bx, "│", edge)
+                    self.screen.addstr(row, bx + bw - 1, "│", edge)
+                self.screen.addstr(bot, bx, "╰" + "─" * (bw - 2) + "╯"[:bw - 1], edge)
+            except curses.error:
+                pass
+            if cur:
+                if not self.filter:
+                    self.ensure_detail(cur)
+                self.draw_pane(cur, bx + 2, bw - 3, top + 1, bot - 1)
+
         # footer
         footer = (" ↑↓ move  enter cd  s shell  n new  e existing  d del  y sync"
-                  "  / filter  t sort  space fold  r refresh  q quit")
-        self.screen.addstr(height - 2, 0, footer[:width - 1], curses.color_pair(6))
+                  "  / filter  t sort  space fold  tab pane  r refresh  q quit")
+        self.screen.addstr(height - 2, 0, footer[:width - 1], curses.color_pair(1))
         if self.message:
             self.screen.addstr(height - 1, 0, self.message[:width - 1],
-                               curses.color_pair(4))
+                               curses.color_pair(5))
         self.screen.refresh()
+
+    def draw_pane(self, entry, x, w, y0, y1):
+        if w < 12:
+            return
+        lines = self.detail_cache.get(entry.path)
+        if lines is None:
+            try:
+                self.screen.addstr(y0, x, f" {entry.name} …",
+                                   self.ATTR["dim"])
+            except curses.error:
+                pass
+            return
+        row = y0
+        for style, text in lines:
+            attr = self.ATTR.get(style, self.ATTR["norm"])
+            if row > y1:
+                try:
+                    self.screen.addstr(y1, x, " … more", self.ATTR["dim"])
+                except curses.error:
+                    pass
+                break
+            for wrapped in textwrap.wrap(text, w - 2) or [""]:
+                if row > y1:
+                    break
+                try:
+                    self.screen.addstr(row, x, (" " + wrapped)[:w - 1], attr)
+                except curses.error:
+                    pass
+                row += 1
+            row += 1  # blank line between sections
 
     def loop(self):
         self.draw()
         while True:
+            # non-blocking polls while detail jobs are in flight
+            self.screen.timeout(250 if self.detail_jobs else -1)
             key = self.screen.getch()
             h, w = self.screen.getmaxyx()
+
             if key == curses.KEY_RESIZE:
                 curses.resizeterm(h, w)
                 self.draw()
+                continue
+
+            if self.reap_detail_jobs():
+                self.draw()  # a detail pane finished computing
+                if key == -1:
+                    continue
+
+            if key == -1:
                 continue
 
             if key == curses.KEY_UP or key == ord("k"):
@@ -355,8 +627,7 @@ class Tui:
             elif key in (10, 13, curses.KEY_ENTER):  # enter
                 e = self.current()
                 if e:
-                    self.result = e.path
-                    return self.result
+                    return e.path
                 continue
             elif key == ord("s"):
                 e = self.current()
@@ -391,13 +662,12 @@ class Tui:
                 self.refresh_data()
                 self.message = f"sorted by {'time' if self.sort_time else 'name'}"
             elif key == ord("/"):
-                text = self.prompt("filter: ", allow_empty=True)
-                self.filter = text or ""
-                self.rebuild_rows()
-                self.top = 0
+                self.filter_prompt()
             elif key == ord("r"):
                 self.refresh_data()
                 self.message = "refreshed"
+            elif key == 9 or key == ord("p"):  # tab toggles the pane
+                self.show_pane = not self.show_pane
             elif key == ord(" ") and self.current() and self.current().kind == "project":
                 name = self.current().name
                 if name in self.collapsed:
@@ -416,7 +686,7 @@ class Tui:
         self.screen.erase()
         h, w = self.screen.getmaxyx()
         lines = __doc__.splitlines()
-        self.screen.addstr(0, 0, " stol tui help", curses.color_pair(1) | curses.A_BOLD)
+        self.screen.addstr(0, 0, " stol tui help", curses.color_pair(2) | curses.A_BOLD)
         for i, line in enumerate(lines[9:], start=1):  # skip module docstring preamble
             if i + 1 >= h:
                 break
@@ -424,12 +694,16 @@ class Tui:
                 self.screen.addstr(i + 1, 0, ("  " + line.strip())[:w - 1])
             except curses.error:
                 pass
-        self.screen.addstr(h - 2, 0, "press any key to return", curses.color_pair(6))
+        self.screen.addstr(h - 2, 0, "press any key to return", curses.color_pair(7))
         self.screen.refresh()
         self.screen.getch()
 
 
 def main():
+    # ncurses waits ESCDELAY ms to disambiguate a lone Esc from escape
+    # sequences; the 1s default makes Esc feel unresponsive
+    os.environ.setdefault("ESCDELAY", "150")
+
     if not os.path.isdir(PROJECTS_DIR):
         print(f"stol tui: no such directory: {PROJECTS_DIR}", file=sys.stderr)
         print("set STOL_ROOT to your stol filesystem root", file=sys.stderr)
@@ -454,6 +728,10 @@ def main():
 
     try:
         result = curses.wrapper(lambda scr: Tui(scr).loop())
+    except KeyboardInterrupt:
+        # Ctrl-C quits without changing directory (terminal is restored by
+        # curses.wrapper's finally before we get here)
+        result = None
     except curses.error as e:
         print(f"stol tui: terminal error: {e}", file=sys.stderr)
         result = None

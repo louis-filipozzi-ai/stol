@@ -193,8 +193,10 @@ scd https://github.com/Applied-Intuition-Open-Source/stol/pull/1
 ## tui
 
 `stol tui` is an interactive terminal UI for browsing and managing all your
-worktrees. It lists every project and worktree under `$STOL_ROOT` with branch
-names, dirty-file counts, and how recently each worktree was used.
+worktrees. It shows a list of every project and worktree under `$STOL_ROOT`
+on the left, and a detail pane on the right for the selected worktree: its
+branch and upstream tracking state, last commit, dirty files, diff stat
+against upstream, and the HEAD reflog.
 
 ```sh
 stol tui          # or use the `stui` shell function to cd on selection
@@ -224,6 +226,7 @@ Keys:
 | `/`   | filter entries by name, branch, or project                |
 | `t`   | toggle sorting by name / modification time                |
 | space | collapse or expand the selected project                   |
+| tab   | toggle the detail pane                                    |
 | `r`   | refresh (re-scan worktrees and git state)                 |
 | `?`   | help                                                      |
 | `q`   | quit without changing directory                           |
