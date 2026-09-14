@@ -22,8 +22,9 @@ usage is from a shell function:
 
 Keys:
     up/down     move selection
-    enter       cd to selected worktree (or project directory)
-    s           open $SHELL in the selected worktree
+    enter       exit and print the selected path (cd via the stui wrapper),
+                or, when run standalone, spawn $SHELL in the worktree
+    s           spawn $SHELL in the selected worktree
     n           create a new worktree in the selected project
     e           check out an existing branch in a new worktree
     d           delete the selected worktree (uses `stol rm`, runs hooks)
@@ -259,7 +260,12 @@ def compute_project_detail(path, entry):
 
 
 class Tui:
-    def __init__(self, screen):
+    def __init__(self, screen, subshell_on_enter=False):
+        self.screen = screen
+        # when run standalone (stdout is a terminal), Enter cannot cd the
+        # parent shell, so it spawns a subshell in the selected worktree
+        # instead; via `cd "$(stol tui)"` it prints the path on stdout
+        self.subshell_on_enter = subshell_on_enter
         self.screen = screen
         self.entries = []
         self.collapsed = set()
@@ -553,7 +559,7 @@ class Tui:
                 self.draw_pane(cur, bx + 2, bw - 3, top + 1, bot - 1)
 
         # footer
-        footer = (" ↑↓ move  enter cd  s shell  n new  e existing  d del  y sync"
+        footer = (" ↑↓ move  enter cd/shell  s shell  n new  e existing  d del  y sync"
                   "  / filter  t sort  space fold  tab pane  r refresh  q quit")
         self.screen.addstr(height - 2, 0, footer[:width - 1], curses.color_pair(1))
         if self.message:
@@ -627,7 +633,10 @@ class Tui:
             elif key in (10, 13, curses.KEY_ENTER):  # enter
                 e = self.current()
                 if e:
-                    return e.path
+                    if self.subshell_on_enter and e.kind != "project":
+                        self.spawn_shell(e.path)
+                    else:
+                        return e.path
                 continue
             elif key == ord("s"):
                 e = self.current()
@@ -727,7 +736,11 @@ def main():
         sys.stdout.reconfigure(line_buffering=True)
 
     try:
-        result = curses.wrapper(lambda scr: Tui(scr).loop())
+        # standalone (stdout is a tty): Enter spawns a subshell since a child
+        # process cannot cd its parent shell; via command substitution Enter
+        # prints the path for the wrapper to cd into
+        result = curses.wrapper(
+            lambda scr: Tui(scr, subshell_on_enter=result_fd is None).loop())
     except KeyboardInterrupt:
         # Ctrl-C quits without changing directory (terminal is restored by
         # curses.wrapper's finally before we get here)

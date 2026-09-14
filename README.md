@@ -202,9 +202,15 @@ against upstream, and the HEAD reflog.
 stol tui          # or use the `stui` shell function to cd on selection
 ```
 
-Because a TUI process cannot change your shell's directory, `stol tui` prints
-the selected path on exit and nothing if you quit. Use the wrapper function
-from `stol-tui.bash` to cd there directly:
+Because a TUI process cannot change your shell's directory, behavior depends
+on how it is invoked:
+
+- **Standalone** (`stol tui`): Enter spawns `$SHELL` in the selected worktree
+  (exit returns to the TUI).
+- **Via command substitution** (`cd "$(stol tui)"`): Enter exits and prints
+  the selected path, which the shell then cds into. Nothing is printed if you
+  quit. Use the wrapper function from `stol-tui.bash` to make this
+  convenient:
 
 ```sh
 # add to your shell config (bash and zsh both work):
